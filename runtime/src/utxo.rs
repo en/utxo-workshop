@@ -1,3 +1,7 @@
+use parity_codec::{Decode, Encode};
+use primitives::{H256, H512};
+use runtime_io::sr25519_verify;
+use runtime_primitives::traits::{BlakeTwo256, Hash};
 /// A runtime module template with necessary imports
 
 /// Feel free to remove or edit this file as needed.
@@ -6,8 +10,33 @@
 
 /// For more guidance on Substrate modules, see the example module
 /// https://github.com/paritytech/substrate/blob/master/srml/example/src/lib.rs
-use support::{decl_event, decl_module, decl_storage, dispatch::Result, StorageValue};
-use system::ensure_signed;
+use support::{
+    decl_event, decl_module, decl_storage,
+    dispatch::{Result, Vec},
+    ensure, StorageMap, StorageValue,
+};
+use system::{ensure_root, ensure_signed};
+
+#[cfg_attr(feature = "std", derive(Debug))]
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+struct TransactionInput {
+    parent_output: H256,
+    signature: H512,
+}
+
+#[cfg_attr(feature = "std", derive(Debug))]
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+struct TransactionOutput {
+    value: u128,
+    pubkey: H256,
+}
+
+#[cfg_attr(feature = "std", derive(Debug))]
+#[derive(Clone, PartialEq, Eq, Encode, Decode)]
+pub struct Transaction {
+    inputs: Vec<TransactionInput>,
+    outputs: Vec<TransactionOutput>,
+}
 
 /// The module's configuration trait.
 pub trait Trait: system::Trait {
@@ -24,6 +53,7 @@ decl_storage! {
         // Here we are declaring a StorageValue, `Something` as a Option<u32>
         // `get(something)` is the default getter which returns either the stored `u32` or `None` if nothing stored
         Something get(something): Option<u32>;
+        UnspentOutputs: map H256 => Option<TransactionOutput>;
     }
 }
 
@@ -49,6 +79,30 @@ decl_module! {
             Self::deposit_event(RawEvent::SomethingStored(something, who));
             Ok(())
         }
+
+        fn mint(origin, value: u128, pubkey: H256) -> Result {
+            ensure_root(origin)?;
+
+            let utxo = TransactionOutput {
+                value: value,
+                pubkey: pubkey,
+            };
+            let hash = BlakeTwo256::hash_of(&utxo);
+            runtime_io::print("new utxo");
+            runtime_io::print(hash.as_bytes());
+            <UnspentOutputs<T>>::insert(hash, utxo);
+
+            Ok(())
+        }
+
+        fn execute(origin, transaction: Transaction) -> Result {
+            ensure_root(origin)?;
+
+            Self::check_transaction(&transaction)?;
+            Self::update_storage(&transaction)?;
+            Self::deposit_event(RawEvent::TransactionExecuted(transaction));
+            Ok(())
+        }
     }
 }
 
@@ -61,8 +115,45 @@ decl_event!(
         // Event `Something` is declared with a parameter of the type `u32` and `AccountId`
         // To emit this event, we call the deposit funtion, from our runtime funtions
         SomethingStored(u32, AccountId),
+        TransactionExecuted(Transaction),
     }
 );
+
+impl<T: Trait> Module<T> {
+    fn check_transaction(transaction: &Transaction) -> Result {
+        for input in transaction.inputs.iter() {
+            if let Some(output) = <UnspentOutputs<T>>::get(input.parent_output) {
+                ensure!(
+                    sr25519_verify(
+                        input.signature.as_fixed_bytes(),
+                        input.parent_output.as_fixed_bytes(),
+                        output.pubkey
+                    ),
+                    "signature must be valid"
+                );
+            } else {
+                return Err("parent output not found");
+            }
+        }
+
+        Ok(())
+    }
+
+    fn update_storage(transaction: &Transaction) -> Result {
+        for input in &transaction.inputs {
+            <UnspentOutputs<T>>::remove(input.parent_output);
+        }
+
+        for output in &transaction.outputs {
+            let hash = BlakeTwo256::hash_of(output);
+            runtime_io::print("insert utxo");
+            runtime_io::print(hash.as_bytes());
+            <UnspentOutputs<T>>::insert(hash, output);
+        }
+
+        Ok(())
+    }
+}
 
 /// tests for this module
 #[cfg(test)]
